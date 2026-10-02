@@ -54,6 +54,10 @@ button,select,textarea,input{font-family:inherit}
   };
   window.dispatchEvent(new Event("fb-ready"));
 </script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+  if(window.pdfjsLib){window.pdfjsLib.GlobalWorkerOptions.workerSrc="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";}
+</script>
 <script type="text/babel">
 const {useState,useRef,useCallback,useMemo}=React;
 
@@ -97,11 +101,27 @@ const DEF_CATS=[
   {id:"i4",name:"Outras Receitas",icon:"💰",color:"#d97706",type:"income"},
 ];
 const DEF_PAY=[
-  {id:"pa1",name:"Cartão Nubank",   icon:"💳",color:"#7c3aed"},
-  {id:"pa2",name:"Cartão Itaú",     icon:"💳",color:"#d97706"},
-  {id:"pa3",name:"PIX / Débito",    icon:"📲",color:"#059669"},
-  {id:"pa4",name:"Dinheiro",        icon:"💵",color:"#64748b"},
+  {id:"pa1",name:"Cartão Nubank",   icon:"💳",color:"#7c3aed",tipo:"cartao",vencDay:10},
+  {id:"pa2",name:"Cartão Itaú",     icon:"💳",color:"#d97706",tipo:"cartao",vencDay:10},
+  {id:"pa3",name:"PIX / Débito",    icon:"📲",color:"#059669",tipo:"outro"},
+  {id:"pa4",name:"Dinheiro",        icon:"💵",color:"#64748b",tipo:"outro"},
 ];
+// Competência (mês em que a fatura vence) de uma compra no cartão, dado o dia de vencimento.
+// Regra (aproximação, sem dia de fechamento exato): compra até o dia (vencDay-1) cai na fatura que vence
+// nesse mesmo mês civil da compra; a partir do dia do vencimento em diante, cai na fatura do mês seguinte.
+function faturaCompetencia(dateStr,vencDay){
+  const[y,m,d]=dateStr.split("-").map(Number);
+  let cy=y,cm=m;
+  if(d>=vencDay){cm+=1;if(cm>12){cm=1;cy+=1;}}
+  return `${cy}-${String(cm).padStart(2,"0")}`;
+}
+// Mês efetivo (competência) de uma transação: usa a lógica de fatura se a conta de pagamento for um cartão
+// de crédito com dia de vencimento definido; senão, usa a data da compra normalmente.
+function effMonth(t,payAccs){
+  const acc=(payAccs||[]).find(p=>p.id===t.payAccId);
+  if(acc&&acc.tipo==="cartao"&&acc.vencDay)return faturaCompetencia(t.date,acc.vencDay);
+  return mOf(t.date);
+}
 const GOAL_META={goal:"🎯",travel:"✈️",purchase:"🛍️",emergency:"🛡️"};
 const GOAL_C={goal:"#4f46e5",travel:"#2563eb",purchase:"#d97706",emergency:"#059669"};
 const EMOJIS=["💼","💻","📈","💰","🏦","🏠","🚗","🍔","💊","📚","🎮","👕","📱","📦","🔧","🛒","🎁","⚡","✈️","🛡️","💎","🏥","🎓","🍕","☕","🐶","🏊","🌿","🚀","🎨"];
@@ -119,7 +139,34 @@ const INIT={userName:"Meu Nome",transactions:[],goals:[],categories:DEF_CATS,pay
 const dlJson=(data,fn)=>{const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:"application/json"}));a.download=fn;document.body.appendChild(a);a.click();document.body.removeChild(a);};
 const rdJson=f=>new Promise((res,rej)=>{const r=new FileReader();r.onload=e=>{try{res(JSON.parse(e.target.result));}catch{rej("JSON inválido");}};r.onerror=()=>rej("Erro");r.readAsText(f);});
 
-function getProj(txs,_bills,_bp,month){
+// Extrai compras parceladas de um texto colado de fatura (padrão "dd/mm DESCRIÇÃO PARC X/Y ... R$ valor")
+const parseValorBR=s=>parseFloat(String(s).replace(/\./g,"").replace(",","."));
+function parseFaturaText(text){
+  const re=/^(\d{2}\/\d{2})\s+(.+?)\s+PARC\s*(\d{1,2})\s*\/\s*(\d{1,2})\b.*?R\$\s*([\d.,]+)\s*$/i;
+  const items=[];
+  (text||"").split(/\r?\n/).forEach((line,idx)=>{
+    const m=line.trim().match(re);
+    if(!m)return;
+    const[,date,desc,cur,tot,valor]=m;
+    const amount=parseValorBR(valor);
+    if(!amount||isNaN(amount))return;
+    items.push({id:"imp-"+idx+"-"+date.replace("/",""),date,desc:desc.trim().replace(/\s{2,}/g," "),current:parseInt(cur),total:parseInt(tot),amount});
+  });
+  return items;
+}
+
+// Data de cada parcela (1..total) de um grupo: usa a data real quando o registro existe; senão projeta mensalmente a partir da 1ª parcela rastreada
+function installmentDateFor(items,i){
+  const byInst={};items.forEach(x=>{byInst[x.installmentOf]=x;});
+  if(byInst[i])return byInst[i].date;
+  const sorted=items.slice().sort((a,b)=>a.installmentOf-b.installmentOf);
+  const anchorInst=sorted[0].installmentOf;
+  const[ay,am]=sorted[0].date.split("-").map(Number);
+  const diff=i-anchorInst;
+  const d=new Date(ay,am-1+diff,1);
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-01`;
+}
+function getProj(txs,_bills,_bp,month,payAccs){
   const proj=[];
   const grps={};
   txs.forEach(t=>{if(!t.groupId||!t.installments)return;if(!grps[t.groupId])grps[t.groupId]={inst:t.installments,exist:{},base:t};grps[t.groupId].exist[t.installmentOf]=mOf(t.date);});
@@ -129,7 +176,7 @@ function getProj(txs,_bills,_bp,month){
     for(let i=1;i<=inst;i++){if(exist[i])continue;const diff=i-minI;const d=new Date(y,m-1+diff,1);const em=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;if(em!==month)continue;proj.push({...base,id:`pj-${base.groupId}-${i}`,date:`${em}-01`,installmentOf:i,isProj:true,projType:"inst"});}
   });
   const recG={};
-  txs.forEach(t=>{if(!t.recurring||t.type!=="income")return;const k=`${t.desc}||${t.catId}||${t.amount}`;if(!recG[k])recG[k]={base:t,months:[]};recG[k].months.push(mOf(t.date));});
+  txs.forEach(t=>{if(!t.recurring||t.type!=="income")return;const k=`${t.desc}||${t.catId}||${t.amount}`;if(!recG[k])recG[k]={base:t,months:[]};recG[k].months.push(effMonth(t,payAccs));});
   Object.values(recG).forEach(({base,months})=>{if(months.includes(month))return;const last=months.sort().pop();if(!last||month<=last)return;const[ly,lm]=last.split("-").map(Number);const[py,pm]=month.split("-").map(Number);if((py-ly)*12+(pm-lm)>12)return;proj.push({...base,id:`pj-rec-${base.id}-${month}`,date:`${month}-01`,isProj:true,projType:"rec"});});
   return proj;
 }
@@ -139,7 +186,7 @@ function buildPdf(state,month,cats,payAccs,bills,billPay){
   const catById=id=>cats.find(c=>c.id===id);
   const payById=id=>payAccs.find(p=>p.id===id);
   const fB=v=>Number(v||0).toLocaleString("pt-BR",{style:"currency",currency:"BRL"});
-  const txs=state.transactions.filter(t=>mOf(t.date)===month).sort((a,b)=>b.date.localeCompare(a.date));
+  const txs=state.transactions.filter(t=>effMonth(t,payAccs)===month).sort((a,b)=>b.date.localeCompare(a.date));
   const expenses=txs.filter(t=>t.type==="expense").reduce((a,t)=>a+t.amount,0);
   const incomes=txs.filter(t=>t.type==="income").reduce((a,t)=>a+t.amount,0);
   const balance=incomes-expenses;
@@ -336,6 +383,7 @@ function Icon({name,size=17,color="currentColor"}){
     case"print":return<svg {...c}><rect x="5.5" y="8.5" width="13" height="7" rx="1"/><path d="M7 8.5V4h10v4.5"/><path d="M7 15v4.5h10V15"/></svg>;
     case"cloud":return<svg {...c}><path d="M7 18h10a3.5 3.5 0 000-7 5 5 0 00-9.6-1.6A4 4 0 007 18z"/></svg>;
     case"download":return<svg {...c}><path d="M12 4v11"/><path d="M8 11l4 4 4-4"/><path d="M5 18h14"/></svg>;
+    case"bolt":return<svg {...c}><path d="M13 3L5 13.5h5.5L10 21l8-10.5h-5.5z"/></svg>;
     default:return null;
   }
 }
@@ -479,6 +527,43 @@ function App(){
   const[toast,setToast]=useState(null);
   const[instPayF,setInstPayF]=useState("all");
   const[instShowDone,setInstShowDone]=useState(false);
+  const[importMod,setImportMod]=useState(false);
+  const[importText,setImportText]=useState("");
+  const[importItems,setImportItems]=useState([]);
+  const[importPayAcc,setImportPayAcc]=useState("");
+  const[pdfBusy,setPdfBusy]=useState(false);
+  const pdfRef=useRef();
+  const extractPdfText=async file=>{
+    const buf=await file.arrayBuffer();
+    const doc=await window.pdfjsLib.getDocument({data:buf}).promise;
+    let allLines=[];
+    for(let p=1;p<=doc.numPages;p++){
+      const page=await doc.getPage(p);
+      const content=await page.getTextContent();
+      const lines={};
+      content.items.forEach(it=>{
+        const y=Math.round(it.transform[5]);
+        if(!lines[y])lines[y]=[];
+        lines[y].push({str:it.str,x:it.transform[4]});
+      });
+      const sortedY=Object.keys(lines).map(Number).sort((a,b)=>b-a);
+      allLines=allLines.concat(sortedY.map(y=>lines[y].sort((a,b)=>a.x-b.x).map(i=>i.str).join(" ").replace(/\s+/g," ").trim()));
+    }
+    return allLines.join("\n");
+  };
+  const handlePdfUpload=async e=>{
+    const f=e.target.files[0];if(!f)return;
+    if(!window.pdfjsLib){notify("❌ Leitor de PDF ainda não carregou, tente de novo em alguns segundos.",T.red,6000);e.target.value="";return;}
+    setPdfBusy(true);
+    try{
+      const text=await extractPdfText(f);
+      setImportText(text);
+      notify("📄 PDF lido! Clique em \"Analisar texto\" pra conferir as compras.");
+    }catch(err){
+      notify("❌ Não consegui ler esse PDF: "+(err.message||err)+". Tente colar o texto manualmente.",T.red,7000);
+    }
+    setPdfBusy(false);e.target.value="";
+  };
   const fileRef=useRef();
 
   const blankGoal={name:"",target:"",saved:"",type:"goal",deadline:"",notes:""};
@@ -486,7 +571,7 @@ function App(){
   const blankBill={name:"",amount:"",category:"Outro",dueDay:10};
   const blankAsset={name:"",type:"conta",value:"",notes:""};
   const[assetF,setAssetF]=useState(blankAsset);
-  const blankPay={name:"",icon:"💳",color:T.indigo};
+  const blankPay={name:"",icon:"💳",color:T.indigo,tipo:"outro",vencDay:""};
   const mkTx=useCallback(type=>({desc:"",amount:"",catId:(state.categories||[]).find(c=>c.type==="expense")?.id||"",payAccId:"",date:today(),type:type||"expense",installMode:"new",installments:"1",startInst:"1",recurring:false,dedupCard:false,dedupCardAmount:""}),[state.categories]);
   const[txF,setTxF]=useState(mkTx("expense"));
   const[goalF,setGoalF]=useState(blankGoal);
@@ -591,8 +676,8 @@ function App(){
   const newFile=()=>{if(dirty&&!window.confirm("Alterações não salvas. Continuar?"))return;setState({...INIT});setJFile("fincontrol-dados.json");setDirty(false);setLoaded(true);notify("📄 Novo arquivo criado");};
   const genPdf=()=>{const html=buildPdf(state,month,cats,payAccs,bills,billPay);const w=window.open("","_blank","width=900,height=700");w.document.write(html);w.document.close();};
 
-  const projs=useMemo(()=>getProj(state.transactions,bills,billPay,month),[state.transactions,bills,billPay,month]);
-  const allTx=useMemo(()=>{const real=state.transactions.filter(t=>mOf(t.date)===month);return showProj?[...real,...projs]:real;},[state.transactions,projs,month,showProj]);
+  const projs=useMemo(()=>getProj(state.transactions,bills,billPay,month,payAccs),[state.transactions,bills,billPay,month,payAccs]);
+  const allTx=useMemo(()=>{const real=state.transactions.filter(t=>effMonth(t,payAccs)===month);return showProj?[...real,...projs]:real;},[state.transactions,projs,month,showProj,payAccs]);
   const filteredTx=useMemo(()=>{
     const base=allTx.filter(t=>!t.isBill).filter(t=>catF==="all"||t.catId===catF).filter(t=>payF==="all"||t.payAccId===payF);
     if(sortMode==="paycat"){
@@ -630,7 +715,7 @@ function App(){
   }).sort((a,b)=>b.pct-a.pct);
   const overBudgetCats=budgetCats.filter(c=>c.over);
 
-  const chartData=useMemo(()=>Array.from({length:10},(_,i)=>i-6).map(i=>{const m=addM(mNow(),i);const txs=state.transactions.filter(t=>mOf(t.date)===m&&!t.isBill);const p=getProj(state.transactions,[],[],m).filter(t=>!t.isBill);const all=[...txs,...p];return{month:m,income:all.filter(t=>t.type==="income").reduce((a,t)=>a+t.amount,0),expense:all.filter(t=>t.type==="expense").reduce((a,t)=>a+t.amount,0)};}),[ state.transactions]);
+  const chartData=useMemo(()=>Array.from({length:10},(_,i)=>i-6).map(i=>{const m=addM(mNow(),i);const txs=state.transactions.filter(t=>effMonth(t,payAccs)===m&&!t.isBill);const p=getProj(state.transactions,[],[],m,payAccs).filter(t=>!t.isBill);const all=[...txs,...p];return{month:m,income:all.filter(t=>t.type==="income").reduce((a,t)=>a+t.amount,0),expense:all.filter(t=>t.type==="expense").reduce((a,t)=>a+t.amount,0)};}),[state.transactions,payAccs]);
 
   const instGroups=useMemo(()=>{
     const g={};
@@ -642,20 +727,9 @@ function App(){
     const td=month===mNow()?today():month+"-31";
     return Object.values(g).map(grp=>{
       const items=grp.items.slice().sort((a,b)=>a.installmentOf-b.installmentOf);
-      const byInst={};
-      items.forEach(i=>{byInst[i.installmentOf]=i;});
-      const anchorInst=items[0].installmentOf;
-      const[ay,am]=items[0].date.split("-").map(Number);
-      // Data de cada parcela: usa a data real quando o registro existe; senão projeta mensalmente a partir da primeira parcela rastreada (mesma lógica de getProj)
-      const dateFor=i=>{
-        if(byInst[i])return byInst[i].date;
-        const diff=i-anchorInst;
-        const d=new Date(ay,am-1+diff,1);
-        return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-01`;
-      };
       let paidCount=0,nextItem=null;
       for(let i=1;i<=grp.total;i++){
-        const dt=dateFor(i);
+        const dt=installmentDateFor(items,i);
         if(dt<=td)paidCount++;
         else if(!nextItem)nextItem={date:dt};
       }
@@ -663,7 +737,7 @@ function App(){
       const paidValue=paidCount*grp.amount;
       const remainingValue=remainingCount*grp.amount;
       const totalValue=grp.total*grp.amount;
-      const lastItem={date:dateFor(grp.total)};
+      const lastItem={date:installmentDateFor(items,grp.total)};
       return{...grp,items,paidCount,remainingCount,paidValue,remainingValue,totalValue,nextItem,lastItem,done:remainingCount<=0};
     }).sort((a,b)=>(a.done===b.done?0:a.done?1:-1)||a.lastItem.date.localeCompare(b.lastItem.date));
   },[state.transactions,month]);
@@ -671,6 +745,50 @@ function App(){
   const instActiveCount=instGroups.filter(g=>!g.done).length;
   const instRemainingTotal=instGroups.filter(g=>!g.done).reduce((a,g)=>a+g.remainingValue,0);
   const instMonthlyCommit=instGroups.filter(g=>!g.done).reduce((a,g)=>a+g.amount,0);
+
+  // ── Antecipar parcelas: knapsack 0/1 exato (maximiza redução mensal dentro do orçamento) ──
+  const[payoffBudget,setPayoffBudget]=useState("");
+  const[payoffResult,setPayoffResult]=useState(null);
+  const[payoffBusy,setPayoffBusy]=useState(false);
+  const[payoffFromMonth,setPayoffFromMonth]=useState(addM(mNow(),1));
+  const payoffCandidates=instGroups.filter(g=>!g.done).map(g=>{
+    const fromDate=payoffFromMonth+"-01";
+    let remainingCount=0;
+    for(let i=1;i<=g.total;i++){if(installmentDateFor(g.items,i)>=fromDate)remainingCount++;}
+    return{groupId:g.groupId,desc:g.desc,catId:g.catId,payAccId:g.payAccId,cost:Math.round(remainingCount*g.amount),benefit:g.amount,remainingCount};
+  }).filter(c=>c.remainingCount>0);
+  const payoffMaxBudget=Math.ceil(payoffCandidates.reduce((s,c)=>s+c.cost,0));
+  const calcPayoff=()=>{
+    const raw=Math.floor(parseFloat(payoffBudget)||0);
+    if(raw<=0){notify("Informe um valor disponível válido",T.amber);return;}
+    const budget=Math.min(raw,payoffMaxBudget);
+    const cands=payoffCandidates;
+    const n=cands.length;
+    if(n===0){setPayoffResult({chosen:[],totalCost:0,totalBenefit:0,budget,raw,leftover:budget});return;}
+    setPayoffBusy(true);
+    // DP 0/1 knapsack exato: dp[i][w] = maior redução mensal possível usando os i primeiros itens com orçamento w
+    const dp=[];
+    for(let i=0;i<=n;i++)dp.push(new Float64Array(budget+1));
+    for(let i=1;i<=n;i++){
+      const{cost,benefit}=cands[i-1];
+      const prev=dp[i-1],cur=dp[i];
+      for(let w=0;w<=budget;w++){
+        cur[w]=prev[w];
+        if(cost<=w){
+          const val=prev[w-cost]+benefit;
+          if(val>cur[w])cur[w]=val;
+        }
+      }
+    }
+    let w=budget;const chosen=[];
+    for(let i=n;i>=1;i--){
+      if(dp[i][w]!==dp[i-1][w]){chosen.push(cands[i-1]);w-=cands[i-1].cost;}
+    }
+    const totalCost=chosen.reduce((s,c)=>s+c.cost,0);
+    const totalBenefit=chosen.reduce((s,c)=>s+c.benefit,0);
+    setPayoffResult({chosen,totalCost,totalBenefit,budget,raw,leftover:budget-totalCost});
+    setPayoffBusy(false);
+  };
 
   const mPay=billPay[month]||{};
   const billsPaid=bills.filter(b=>mPay[b.id]).length;
@@ -708,6 +826,41 @@ function App(){
   const delTx=t=>upd({transactions:state.transactions.filter(x=>x.id!==t.id)});
   const delGrp=t=>upd({transactions:state.transactions.filter(x=>x.groupId!==t.groupId)});
 
+  // ── Importar compras parceladas de texto colado da fatura ──
+  const openImportMod=()=>{
+    setImportPayAcc(payAccs.find(p=>p.tipo==="cartao")?.id||payAccs[0]?.id||"");
+    setImportText("");setImportItems([]);setImportMod(true);
+  };
+  const runImportParse=()=>{
+    const parsed=parseFaturaText(importText);
+    if(parsed.length===0){notify("Nenhuma linha reconhecida. Confira se colou o texto com o padrão \"dd/mm DESCRIÇÃO PARC X/Y ... R$ valor\".",T.amber,6000);return;}
+    const defCat=cats.find(c=>c.type==="expense")?.id||"";
+    const activeGroups=instGroups.filter(g=>!g.done);
+    setImportItems(parsed.map(p=>{
+      // "Impressão digital" da compra: mesmo total de parcelas + mesmo valor de parcela ⇒ provavelmente a mesma compra,
+      // mesmo que o nome do estabelecimento mude de uma fatura pra outra (ex: "PNEU" numa fatura, "Mlivre" na seguinte)
+      const match=activeGroups.find(g=>g.total===p.total&&Math.abs(g.amount-p.amount)<0.05);
+      return{...p,selected:!match,catId:defCat,matchedGroup:match?{groupId:match.groupId,desc:match.desc}:null};
+    }));
+  };
+  const confirmImport=()=>{
+    const chosen=importItems.filter(i=>i.selected);
+    if(chosen.length===0)return;
+    const base=today();
+    let allNew=[];
+    chosen.forEach((it,idx)=>{
+      const gid=Date.now()+idx*1000;
+      const newTx=Array.from({length:it.total-it.current+1},(_,i)=>{
+        const d=new Date(base);d.setMonth(d.getMonth()+i);
+        return{id:gid+i,desc:it.desc,catId:it.catId,payAccId:it.payAccId||importPayAcc,amount:it.amount,type:"expense",date:d.toISOString().split("T")[0],installments:it.total,installmentOf:it.current+i,groupId:gid,recurring:false};
+      });
+      allNew=[...allNew,...newTx];
+    });
+    upd({transactions:[...state.transactions,...allNew]});
+    notify(`✅ ${chosen.length} compra${chosen.length>1?"s":""} importada${chosen.length>1?"s":""}`);
+    setImportMod(false);setImportText("");setImportItems([]);
+  };
+
   const openNewGoal=()=>{setGoalF(blankGoal);setGoalMod("new");};
   const openEditGoal=g=>{setGoalF({name:g.name,target:String(g.target),saved:String(g.saved),type:g.type,deadline:g.deadline||"",notes:g.notes||""});setGoalMod(g);};
   const saveGoal=()=>{if(!goalF.name.trim()||!goalF.target)return;const g={...goalF,target:parseFloat(goalF.target),saved:parseFloat(goalF.saved||0)};if(goalMod!=="new")upd({goals:state.goals.map(x=>x.id===goalMod.id?{...x,...g}:x)});else upd({goals:[...state.goals,{id:Date.now(),...g,checklist:[]}]});setGoalMod(false);};
@@ -725,12 +878,12 @@ function App(){
   const totalDebtsVal=assets.filter(a=>a.type==="divida").reduce((s,a)=>s+a.value,0);
   const netWorth=totalAssetsVal-totalDebtsVal;
 
-  const savePayAcc=()=>{if(!payFrm.name.trim())return;if(editPayId)upd({payAccounts:payAccs.map(p=>p.id===editPayId?{...p,...payFrm}:p)});else upd({payAccounts:[...payAccs,{id:"pa"+Date.now(),...payFrm}]});setPayFrm(blankPay);setEditPayId(null);};
+  const savePayAcc=()=>{if(!payFrm.name.trim())return;const p={...payFrm,vencDay:payFrm.tipo==="cartao"&&payFrm.vencDay?parseInt(payFrm.vencDay):null};if(editPayId)upd({payAccounts:payAccs.map(x=>x.id===editPayId?{...x,...p}:x)});else upd({payAccounts:[...payAccs,{id:"pa"+Date.now(),...p}]});setPayFrm(blankPay);setEditPayId(null);};
   const savecat=()=>{if(!catFrm.name.trim())return;const budget=catFrm.type==="expense"&&catFrm.budget?parseFloat(catFrm.budget):null;if(editCatId)upd({categories:cats.map(c=>c.id===editCatId?{...c,...catFrm,budget}:c)});else upd({categories:[...cats,{id:"u"+Date.now(),...catFrm,budget}]});setCatFrm(blankCat);setEditCatId(null);};
   const delCat=id=>{if(state.transactions.some(t=>t.catId===id)){alert("Possui lançamentos. Remova antes.");return;}upd({categories:cats.filter(c=>c.id!==id)});};
 
-  const TABS=["Dashboard","Lançamentos","Metas","Contas","Parcelamentos","Patrimônio"];
-  const TAB_ICONS=["dashboard","swap","target","calendar","card","wallet"];
+  const TABS=["Dashboard","Lançamentos","Metas","Contas","Parcelamentos","Patrimônio","Antecipar"];
+  const TAB_ICONS=["dashboard","swap","target","calendar","card","wallet","bolt"];
 
   const cloudModalEl=cloudMod&&(
     <Modal title="Carregar perfil da nuvem" onClose={()=>setCloudMod(false)} z={500}>
@@ -1114,6 +1267,7 @@ function App(){
                 Mostrar quitadas
               </label>
               <Btn onClick={()=>openNewTx("expense")} color={T.red} style={{padding:"7px 14px",fontSize:12}}>+ Nova Compra Parcelada</Btn>
+              <Btn variant="ghost" onClick={openImportMod} style={{padding:"7px 14px",fontSize:12}}>📋 Importar da fatura</Btn>
             </div>
             <p style={{fontSize:11,color:T.dim,marginTop:-14,marginBottom:18}}>Situação calculada até {new Date(month+"-02").toLocaleDateString("pt-BR",{month:"long",year:"numeric"})}{month===mNow()?" (hoje)":""}</p>
 
@@ -1221,9 +1375,134 @@ function App(){
             )}
           </div>
         )}
+
+        {/* ── ANTECIPAR PARCELAS ── */}
+        {tab===6&&(
+          <div>
+            <div style={{display:"flex",gap:10,marginBottom:8,alignItems:"center",flexWrap:"wrap"}}>
+              <h1 style={{fontSize:20,fontWeight:800,flex:1,letterSpacing:"-.5px"}}>Antecipar Parcelas</h1>
+            </div>
+            <p style={{fontSize:12,color:T.dim,marginBottom:14,maxWidth:640}}>Informe quanto você tem disponível pra adiantar compras parceladas. Eu calculo a <strong style={{color:T.text}}>combinação exata</strong> (testando todas as possibilidades) que mais reduz sua fatura mensal dentro desse valor — priorizando quem tem menos parcelas restantes, que é o melhor custo-benefício.</p>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:20}}>
+              <Label style={{marginBottom:0}}>Considerar parcelas a partir de</Label>
+              <input type="month" value={payoffFromMonth} onChange={e=>setPayoffFromMonth(e.target.value)} style={{...inp,width:"auto",padding:"6px 10px",fontSize:12}}/>
+              <span style={{fontSize:11,color:T.dim}}>(a parcela que já vence antes disso não entra na conta — ela já vai ser paga na fatura normal)</span>
+            </div>
+
+            {payoffCandidates.length===0?(
+              <div style={{textAlign:"center",padding:56,color:T.dim}}>
+                <div style={{fontSize:36,marginBottom:12}}>⚡</div>
+                Nenhuma compra parcelada ativa pra antecipar.
+              </div>
+            ):(<>
+              <Card style={{marginBottom:20,maxWidth:480}}>
+                <Label>Valor disponível para adiantar</Label>
+                <div style={{display:"flex",gap:8}}>
+                  <Inp type="number" value={payoffBudget} onChange={e=>setPayoffBudget(e.target.value)} placeholder="Ex: 10000" onKeyDown={e=>e.key==="Enter"&&calcPayoff()}/>
+                  <Btn onClick={calcPayoff} disabled={payoffBusy} style={{whiteSpace:"nowrap"}}>{payoffBusy?"Calculando...":"Calcular"}</Btn>
+                </div>
+                <div style={{fontSize:11,color:T.dim,marginTop:8}}>Total em aberto: {fmtBRL(payoffMaxBudget)} em {payoffCandidates.length} compra{payoffCandidates.length===1?"":"s"} ativa{payoffCandidates.length===1?"":"s"}. Valores arredondados ao real mais próximo para o cálculo.</div>
+              </Card>
+
+              {payoffResult&&(
+                <>
+                  <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(170px,1fr))",gap:12,marginBottom:20}}>
+                    <KPI label="Compras a quitar" value={String(payoffResult.chosen.length)} color={T.indigo} icon="⚡"/>
+                    <KPI label="Valor usado" value={fmtBRL(payoffResult.totalCost)} color={T.red} icon="💸" sub={payoffResult.leftover>0?`sobra ${fmtBRL(payoffResult.leftover)}`:undefined}/>
+                    <KPI label="Fatura mensal cai" value={fmtBRL(payoffResult.totalBenefit)} color={T.green} icon="📉" sub="por mês, a partir de agora"/>
+                  </div>
+
+                  {payoffResult.raw>payoffMaxBudget&&<div style={{background:T.indigoBg,border:`1px solid ${T.indigo}33`,borderRadius:10,padding:"9px 14px",marginBottom:16,fontSize:12,color:T.indigo}}>ℹ️ Você informou {fmtBRL(payoffResult.raw)}, mas o total em aberto é {fmtBRL(payoffMaxBudget)} — usei esse teto no cálculo.</div>}
+
+                  {payoffResult.chosen.length===0?(
+                    <div style={{textAlign:"center",padding:40,color:T.dim,fontSize:13}}>Nenhuma compra cabe dentro desse valor (a mais barata pra quitar custa {fmtBRL(Math.min(...payoffCandidates.map(c=>c.cost)))}).</div>
+                  ):(
+                    <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                      <p style={{fontSize:11,fontWeight:700,color:T.sub,textTransform:"uppercase",letterSpacing:.5}}>Ordem recomendada de quitação</p>
+                      {payoffResult.chosen.sort((a,b)=>a.remainingCount-b.remainingCount).map((c,idx)=>{const cat=catById(c.catId),pay=payById(c.payAccId);return(
+                        <div key={c.groupId} style={{display:"flex",alignItems:"center",gap:12,background:T.white,border:`1px solid ${T.border}`,borderLeft:`3px solid ${T.green}`,borderRadius:8,padding:"10px 14px"}}>
+                          <span style={{fontSize:12,fontWeight:700,color:T.dim,width:18}}>{idx+1}º</span>
+                          <span style={{fontSize:18}}>{cat?.icon||"🧾"}</span>
+                          <div style={{flex:1,minWidth:0}}>
+                            <div style={{fontWeight:600,fontSize:13,color:T.text}}>{c.desc}</div>
+                            <div style={{fontSize:11,color:T.dim}}>{pay?.name||""} · {c.remainingCount}x restante{c.remainingCount===1?"":"s"}</div>
+                          </div>
+                          <div style={{textAlign:"right"}}>
+                            <div style={{fontWeight:700,fontSize:13,color:T.red}}>{fmtBRL(c.cost)}</div>
+                            <div style={{fontSize:10,color:T.green}}>-{fmtBRL(c.benefit)}/mês</div>
+                          </div>
+                        </div>
+                      );})}
+                    </div>
+                  )}
+                </>
+              )}
+            </>)}
+          </div>
+        )}
       </main>
       </div>
       {cloudModalEl}
+
+      {importMod&&<Modal title="📋 Importar compras parceladas da fatura" onClose={()=>{setImportMod(false);setImportText("");setImportItems([]);}} wide>
+        {importItems.length===0?(
+          <div style={{display:"flex",flexDirection:"column",gap:12}}>
+            <p style={{fontSize:12,color:T.sub}}>Envie o PDF da fatura, ou copie e cole a seção "Compras parceladas" manualmente. Reconheço linhas no padrão <code style={{background:T.muted,padding:"1px 5px",borderRadius:4}}>dd/mm DESCRIÇÃO PARC X/Y ... R$ valor</code>.</p>
+            <div>
+              <Label>Cartão desta fatura</Label>
+              <Sel value={importPayAcc} onChange={e=>setImportPayAcc(e.target.value)}>
+                {payAccs.map(p=><option key={p.id} value={p.id}>{p.icon} {p.name}</option>)}
+              </Sel>
+            </div>
+            <div style={{display:"flex",alignItems:"center",gap:10}}>
+              <Btn onClick={()=>pdfRef.current.click()} disabled={pdfBusy} style={{padding:"9px 18px"}}>{pdfBusy?"⏳ Lendo PDF...":"📄 Enviar PDF da fatura"}</Btn>
+              <span style={{fontSize:11,color:T.dim}}>ou cole o texto manualmente abaixo</span>
+              <input ref={pdfRef} type="file" accept="application/pdf" onChange={handlePdfUpload} style={{display:"none"}}/>
+            </div>
+            <div>
+              <Label>Texto da fatura</Label>
+              <textarea value={importText} onChange={e=>setImportText(e.target.value)} rows={10} placeholder={"Ex:\n08/04 KAVAK PARC 18/21 BARUERI BR R$ 722,43\n18/09 MP*INNERAI PARC 12/12 SAO PAULO BR R$ 89,90"} style={{...inp,resize:"vertical",fontFamily:"monospace",fontSize:11.5}}/>
+            </div>
+            <Btn onClick={runImportParse} style={{alignSelf:"flex-start",padding:"8px 18px"}}>Analisar texto</Btn>
+          </div>
+        ):(
+          <div style={{display:"flex",flexDirection:"column",gap:12}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <p style={{fontSize:12,color:T.sub}}>{importItems.length} compra{importItems.length>1?"s":""} reconhecida{importItems.length>1?"s":""}
+                {importItems.some(i=>i.matchedGroup)&&<> · <span style={{color:T.amber,fontWeight:600}}>{importItems.filter(i=>i.matchedGroup).length} já cadastrada{importItems.filter(i=>i.matchedGroup).length>1?"s":""} (desmarcada{importItems.filter(i=>i.matchedGroup).length>1?"s":""} pra não duplicar)</span></>}
+              </p>
+              <Btn variant="ghost" onClick={()=>setImportItems([])} style={{padding:"6px 12px",fontSize:11}}>↺ Colar outro texto</Btn>
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:6,maxHeight:380,overflowY:"auto"}}>
+              {importItems.map((it,idx)=><div key={it.id} style={{display:"flex",flexDirection:"column",gap:5,background:it.selected?T.muted:it.matchedGroup?T.amberBg:"transparent",border:`1px solid ${it.matchedGroup?T.amber+"55":T.border}`,borderRadius:8,padding:"7px 10px",opacity:it.selected||it.matchedGroup?1:.5}}>
+                <div style={{display:"flex",alignItems:"center",gap:8}}>
+                  <input type="checkbox" checked={it.selected} onChange={e=>setImportItems(arr=>arr.map((x,i)=>i===idx?{...x,selected:e.target.checked}:x))} style={{accentColor:T.indigo,flexShrink:0}}/>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontWeight:600,fontSize:12,color:T.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{it.desc}</div>
+                    <div style={{fontSize:10,color:T.dim}}>{it.current}/{it.total} parcelas · {it.date}</div>
+                  </div>
+                  <Sel value={it.catId} onChange={e=>setImportItems(arr=>arr.map((x,i)=>i===idx?{...x,catId:e.target.value}:x))} style={{width:150,fontSize:11,padding:"5px 8px"}}>
+                    {cats.filter(c=>c.type==="expense").map(c=><option key={c.id} value={c.id}>{c.icon} {c.name}</option>)}
+                  </Sel>
+                  <span style={{fontWeight:700,fontSize:12,color:T.text,width:72,textAlign:"right",flexShrink:0}}>{fmtBRL(it.amount)}</span>
+                </div>
+                {it.matchedGroup&&<div style={{fontSize:10.5,color:T.amber,display:"flex",alignItems:"center",gap:6,paddingLeft:24}}>
+                  🔗 Já cadastrada como <strong>"{it.matchedGroup.desc}"</strong> (mesmo total de parcelas e valor)
+                  {!it.selected?
+                    <button onClick={()=>setImportItems(arr=>arr.map((x,i)=>i===idx?{...x,selected:true}:x))} style={{background:"none",border:"none",color:T.indigo,textDecoration:"underline",cursor:"pointer",fontSize:10.5,fontWeight:600}}>não, é diferente</button>
+                    :
+                    <button onClick={()=>setImportItems(arr=>arr.map((x,i)=>i===idx?{...x,selected:false}:x))} style={{background:"none",border:"none",color:T.dim,textDecoration:"underline",cursor:"pointer",fontSize:10.5}}>desfazer</button>
+                  }
+                </div>}
+              </div>)}
+            </div>
+            <div style={{display:"flex",gap:8}}>
+              <Btn onClick={confirmImport} style={{flex:1,padding:10}}>Adicionar {importItems.filter(i=>i.selected).length} selecionada{importItems.filter(i=>i.selected).length!==1?"s":""}</Btn>
+              <Btn variant="ghost" onClick={()=>{setImportMod(false);setImportText("");setImportItems([]);}} style={{padding:"10px 16px"}}>Cancelar</Btn>
+            </div>
+          </div>
+        )}
+      </Modal>}
 
       {/* ── MODAIS ── */}
       {txMod&&<Modal title={txMod==="new"?"Novo Lançamento":"Editar Lançamento"} onClose={()=>{setTxMod(false);setShowCalc(false);setCalcExpr("");setCalcResult("");}}>
@@ -1354,8 +1633,9 @@ function App(){
         <div style={{display:"flex",flexDirection:"column",gap:5,marginBottom:14,maxHeight:200,overflowY:"auto"}}>
           {payAccs.map(p=><div key={p.id} style={{display:"flex",alignItems:"center",gap:10,background:T.muted,borderRadius:8,padding:"9px 13px",border:`1px solid ${T.border}`}}>
             <span style={{fontSize:18}}>{p.icon}</span><div style={{width:8,height:8,borderRadius:"50%",background:p.color,flexShrink:0}}/><span style={{flex:1,fontSize:13,fontWeight:600}}>{p.name}</span>
+            {p.tipo==="cartao"&&<span style={{fontSize:10,color:T.amber,fontWeight:700}}>vence dia {p.vencDay||"?"}</span>}
             <span style={{fontSize:10,color:T.dim}}>{state.transactions.filter(t=>t.payAccId===p.id).length} lançamentos</span>
-            <button onClick={()=>{setPayFrm({name:p.name,icon:p.icon,color:p.color});setEditPayId(p.id);}} style={{background:"none",border:"none",color:T.dim,cursor:"pointer",fontSize:13}}>✏️</button>
+            <button onClick={()=>{setPayFrm({name:p.name,icon:p.icon,color:p.color,tipo:p.tipo||"outro",vencDay:p.vencDay?String(p.vencDay):""});setEditPayId(p.id);}} style={{background:"none",border:"none",color:T.dim,cursor:"pointer",fontSize:13}}>✏️</button>
             <button onClick={()=>{if(state.transactions.some(t=>t.payAccId===p.id)){alert("Possui lançamentos.");return;}upd({payAccounts:payAccs.filter(x=>x.id!==p.id)});}} style={{background:"none",border:"none",color:T.dim,cursor:"pointer",fontSize:13}}>🗑</button>
           </div>)}
         </div>
@@ -1367,6 +1647,11 @@ function App(){
           </div>
           <Label>Cor</Label>
           <div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:10}}>{PALETTE.map(c=><button key={c} onClick={()=>setPayFrm(f=>({...f,color:c}))} style={{width:22,height:22,borderRadius:"50%",background:c,border:`3px solid ${payFrm.color===c?'#1e293b':'transparent'}`,cursor:"pointer"}}/>)}</div>
+          <label style={{display:"flex",alignItems:"center",gap:7,fontSize:12,color:T.sub,cursor:"pointer",userSelect:"none",marginBottom:10}}>
+            <input type="checkbox" checked={payFrm.tipo==="cartao"} onChange={e=>setPayFrm(f=>({...f,tipo:e.target.checked?"cartao":"outro"}))} style={{accentColor:T.indigo}}/>
+            É cartão de crédito (compras contam no mês em que a fatura vence, não no mês da compra)
+          </label>
+          {payFrm.tipo==="cartao"&&<div style={{marginBottom:10}}><Label>Dia de vencimento da fatura</Label><Inp type="number" min="1" max="31" value={payFrm.vencDay} onChange={e=>setPayFrm(f=>({...f,vencDay:e.target.value}))} placeholder="Ex: 10" style={{maxWidth:120}}/></div>}
           <div style={{display:"flex",gap:7}}><Btn onClick={savePayAcc} style={{padding:"8px 18px",fontSize:12}}>{editPayId?"Salvar":"Criar"}</Btn>{editPayId&&<Btn variant="ghost" onClick={()=>{setPayFrm(blankPay);setEditPayId(null);}} style={{padding:"8px 12px",fontSize:12}}>Cancelar</Btn>}</div>
         </div>
       </Modal>}
